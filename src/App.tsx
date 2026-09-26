@@ -1,42 +1,460 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronRight, Clock3, Mic, Pause, Play, Plus, RotateCcw, Search, Trash2, Volume2 } from 'lucide-react';
+import {
+  AlertOctagon,
+  AlertTriangle,
+  FileDown,
+  FileUp,
+  Plus,
+  RotateCcw,
+  Scale,
+  Search,
+  ShieldCheck,
+} from 'lucide-react';
 
-type Phrase = { id: number; text: string; translation: string; tag: string; level: '入门'|'进阶'|'挑战'; status: 'new'|'practice'|'mastered'; attempts: number; last?: string };
-const seed: Phrase[] = [
-  { id: 1, text: 'The morning light feels different today.', translation: '今天的晨光感觉不一样。', tag: '日常', level: '入门', status: 'practice', attempts: 3, last: '今天 09:24' },
-  { id: 2, text: 'Could you walk me through the next step?', translation: '你能带我了解下一步吗？', tag: '工作', level: '进阶', status: 'new', attempts: 0 },
-  { id: 3, text: 'I appreciate your patience and thoughtful feedback.', translation: '感谢你的耐心和细致反馈。', tag: '表达', level: '挑战', status: 'mastered', attempts: 8, last: '昨天 18:10' },
-  { id: 4, text: 'Let’s make room for a little curiosity.', translation: '给好奇心留一点空间。', tag: '灵感', level: '入门', status: 'new', attempts: 0 },
-];
-const bars = Array.from({ length: 68 }, (_, i) => 18 + ((i * 29) % 44));
+type Verdict = 'ok' | 'review' | 'risk';
+
+type Entry = {
+  id: string;
+  name: string;
+  version: string;
+  license: string;
+  verdict: Verdict;
+  reason: string;
+};
+
+const STORAGE_KEY = 'license-lens-entries-v1';
+
+const SEED_TEXT = [
+  'react@18.3.1 MIT',
+  'lodash@4.17.21 MIT',
+  'sharp@0.33.4 Apache-2.0',
+  'some-proprietary@1.0.0 Proprietary',
+  'legacy-gpl@2.4.0 GPL-3.0',
+  'axios@1.7.2 MIT',
+  'zod@3.23.8 MIT',
+  'font-awesome@6.5.2 CC-BY-4.0',
+].join('\n');
+
+const VERDICT_LABEL: Record<Verdict, string> = {
+  ok: '兼容通过',
+  review: '需复核',
+  risk: '高风险',
+};
+
+const OK_REASON =
+  '宽松许可证，保留版权声明与许可证文本后即可随项目分发，与本项目分发方式兼容。';
+const RISK_REASON =
+  '强 Copyleft 许可证，衍生作品需以相同许可证公开源码，可能与商业分发方式冲突。';
+const PROPRIETARY_REASON =
+  '专有许可证，需确认授权范围、再分发权利与使用限制后再下结论。';
+const UNKNOWN_REASON =
+  '未识别的许可证，需要人工确认许可证文本与项目使用方式是否兼容。';
+
+let idCounter = 0;
+const nextId = () => `${Date.now().toString(36)}-${idCounter++}`;
+
+function classify(rawLicense: string): { license: string; verdict: Verdict; reason: string } {
+  const license = rawLicense.trim() || 'Unknown';
+  const norm = license.toLowerCase().replace(/[\s_]+/g, '');
+
+  if (norm === 'mit' || norm === 'apache-2.0' || norm === 'apache2.0' || norm === 'bsd-3-clause') {
+    return { license, verdict: 'ok', reason: OK_REASON };
+  }
+  if (/^(agpl|gpl|gplv?2|gplv?3)(-?\d+(\.\d+)?)?(-only|-or-later)?$/.test(norm) || norm.startsWith('gpl')) {
+    return { license, verdict: 'risk', reason: RISK_REASON };
+  }
+  if (norm === 'proprietary' || norm === 'commercial' || norm === 'unlicensed') {
+    return { license, verdict: 'review', reason: PROPRIETARY_REASON };
+  }
+  return { license, verdict: 'review', reason: UNKNOWN_REASON };
+}
+
+function makeEntry(name: string, version: string, rawLicense: string): Entry {
+  const { license, verdict, reason } = classify(rawLicense);
+  return { id: nextId(), name, version, license, verdict, reason };
+}
+
+function parseLine(line: string): Entry | null {
+  const s = line.trim();
+  if (!s || s.startsWith('#') || s.startsWith('//')) return null;
+
+  // 支持 CSV 形式：name,version,license
+  const csv = s.match(/^([^,@\s]+)\s*,\s*([^,\s]+)\s*,\s*(.+)$/);
+  if (csv) return makeEntry(csv[1], csv[2], csv[3]);
+
+  // 标准形式：name@version license（兼容 @scope/name@version）
+  const full = s.match(/^(.+?)@([^\s@]+)\s+(.+)$/);
+  if (full) return makeEntry(full[1], full[2], full[3]);
+
+  // 只有 name@version，没有声明许可证
+  const noLic = s.match(/^(.+?)@([^\s@]+)$/);
+  if (noLic) return makeEntry(noLic[1], noLic[2], 'Unknown');
+
+  // 只有名称
+  return makeEntry(s, '—', 'Unknown');
+}
+
+function parseManifest(text: string): { entries: Entry[]; note: string } {
+  const trimmed = text.trim();
+  if (!trimmed) return { entries: [], note: '没有可分析的内容' };
+
+  // package.json：提取 dependencies / devDependencies，许可证待人工确认
+  if (trimmed.startsWith('{')) {
+    try {
+      const pkg = JSON.parse(trimmed) as Record<string, unknown>;
+      const sections = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'];
+      const entries: Entry[] = [];
+      for (const key of sections) {
+        const deps = pkg[key];
+        if (deps && typeof deps === 'object') {
+          for (const [name, version] of Object.entries(deps as Record<string, string>)) {
+            entries.push(makeEntry(name, String(version), 'Unknown'));
+          }
+        }
+      }
+      if (entries.length > 0) {
+        return { entries, note: `已从 package.json 提取 ${entries.length} 条依赖，许可证均需人工确认` };
+      }
+      return { entries: [], note: 'JSON 中未找到 dependencies 字段' };
+    } catch {
+      return { entries: [], note: 'JSON 解析失败，请检查文件内容' };
+    }
+  }
+
+  const entries = trimmed
+    .split(/\r?\n/)
+    .map(parseLine)
+    .filter((e): e is Entry => e !== null);
+  return { entries, note: `分析完成 · 已检查 ${entries.length} 条依赖` };
+}
+
+const seedEntries = () => parseManifest(SEED_TEXT).entries;
+
+function loadEntries(): Entry[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Entry[];
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+  } catch {
+    /* 数据损坏时回退到示例 */
+  }
+  return seedEntries();
+}
 
 export default function App() {
-  const [phrases, setPhrases] = useState<Phrase[]>(() => { try { return JSON.parse(localStorage.getItem('sound-lab-phrases') || '') || seed; } catch { return seed; } });
-  const [selected, setSelected] = useState(phrases[0]?.id ?? 1);
-  const [filter, setFilter] = useState('全部');
+  const [entries, setEntries] = useState<Entry[]>(loadEntries);
+  const [input, setInput] = useState('');
+  const [filter, setFilter] = useState<'all' | Verdict>('all');
   const [query, setQuery] = useState('');
-  const [recording, setRecording] = useState(false);
-  const [playing, setPlaying] = useState(false);
-  const [recorded, setRecorded] = useState(false);
-  const [seconds, setSeconds] = useState(0);
-  const [showAdd, setShowAdd] = useState(false);
-  const [newText, setNewText] = useState('');
-  const timer = useRef<number | undefined>(undefined);
-  const current = phrases.find(p => p.id === selected) ?? phrases[0];
-  const filtered = useMemo(() => phrases.filter(p => (filter === '全部' || p.tag === filter || p.level === filter || (filter === '待练' && p.status !== 'mastered')) && p.text.toLowerCase().includes(query.toLowerCase())), [phrases, filter, query]);
-  const tags = ['全部', ...Array.from(new Set(phrases.map(p => p.tag)))];
-  useEffect(() => { localStorage.setItem('sound-lab-phrases', JSON.stringify(phrases)); }, [phrases]);
-  useEffect(() => () => window.clearInterval(timer.current), []);
-  const startRecord = () => { if (recording) { setRecording(false); window.clearInterval(timer.current); setRecorded(true); setPhrases(ps => ps.map(p => p.id === selected ? {...p, attempts: p.attempts + 1, status: 'practice', last: '刚刚'} : p)); return; } setSeconds(0); setRecording(true); timer.current = window.setInterval(() => setSeconds(s => s + 1), 1000); };
-  const addPhrase = () => { if (!newText.trim()) return; const id = Date.now(); setPhrases(ps => [...ps, { id, text: newText.trim(), translation: '待补充译文', tag: '自定义', level: '入门', status: 'new', attempts: 0 }]); setSelected(id); setNewText(''); setShowAdd(false); };
-  const removePhrase = () => { if (!current) return; setPhrases(ps => ps.filter(p => p.id !== current.id)); setSelected(filtered.find(p => p.id !== current.id)?.id ?? phrases.find(p => p.id !== current.id)?.id ?? 0); };
-  return <div className="app-shell">
-    <aside className="sidebar"><div className="brand"><div className="brand-mark"><Volume2 size={19}/></div><div><strong>声线练习室</strong><span>Pronounce / practice</span></div></div><div className="side-label">我的练习</div><nav><button className="side-link active"><Mic size={17}/>练习库 <b>{phrases.length}</b></button><button className="side-link"><Clock3 size={17}/>练习记录</button><button className="side-link"><Check size={17}/>已掌握 <b>{phrases.filter(p => p.status === 'mastered').length}</b></button></nav><div className="sidebar-foot"><div className="streak"><span>连续练习</span><strong>5 <small>天</small></strong><i>↗ +2</i></div><div className="profile"><div className="avatar">YL</div><div><strong>Yuki Lin</strong><span>普通计划</span></div><ChevronRight size={16}/></div></div></aside>
-    <main className="main"><header className="topbar"><div><p className="eyebrow">WEDNESDAY, SEP 12</p><h1>今天练什么？</h1></div><div className="top-actions"><div className="search"><Search size={16}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索句子"/></div><button className="primary" onClick={() => setShowAdd(true)}><Plus size={17}/>添加句子</button></div></header>
-      <section className="stats"><div><span>本周完成</span><strong>12 <em>/ 20</em></strong><div className="progress"><i style={{width:'60%'}}/></div></div><div><span>练习时长</span><strong>38 <em>分钟</em></strong><small>比上周多 8 分钟</small></div><div><span>最佳发音</span><strong>92 <em>分</em></strong><small className="green">↑ 6 分</small></div></section>
-      <div className="content-grid"><section className="library"><div className="section-head"><div><h2>句子库</h2><p>选择一句开始你的声音训练</p></div><button className="ghost" onClick={() => setFilter('待练')}>只看待练</button></div><div className="filters">{tags.map(t => <button key={t} className={filter === t ? 'chip active' : 'chip'} onClick={() => setFilter(t)}>{t}</button>)}</div><div className="phrase-list">{filtered.map(p => <button key={p.id} onClick={() => {setSelected(p.id); setRecorded(false)}} className={p.id === selected ? 'phrase selected' : 'phrase'}><div className="phrase-icon">{p.status === 'mastered' ? <Check size={15}/> : <Mic size={15}/>}</div><div className="phrase-copy"><strong>{p.text}</strong><span>{p.translation}</span><div className="phrase-meta"><i>{p.tag}</i><i>{p.level}</i>{p.attempts > 0 && <small>{p.attempts} 次练习</small>}</div></div><ChevronRight size={17}/></button>)}{filtered.length === 0 && <div className="empty">没有找到匹配句子</div>}</div></section>
-        {current && <section className="practice"><div className="practice-head"><div><span className="label">CURRENT PHRASE</span><h2>跟着感觉读</h2></div><button className="icon-btn" onClick={removePhrase} title="删除句子"><Trash2 size={17}/></button></div><div className="focus-card"><div className="focus-tag">{current.tag} · {current.level}</div><p className="focus-text">{current.text}</p><p className="focus-translation">{current.translation}</p><div className="audio-sample"><button className="round-btn" onClick={() => setPlaying(!playing)}>{playing ? <Pause size={18}/> : <Play size={18}/>}</button><div className="sample-wave">{bars.map((h,i) => <i key={i} style={{height: `${h * (playing ? 1.15 : 0.72)}%`}}/> )}</div><span>0:08</span></div></div><div className="record-card"><div className="record-top"><div><span className="label">YOUR RECORDING</span><h3>{recorded ? '录音已保存，听听自己的声音' : '准备好后开始录音'}</h3></div><span className="record-time">{String(Math.floor(seconds / 60)).padStart(2,'0')}:{String(seconds % 60).padStart(2,'0')}</span></div><div className="record-wave">{bars.slice(5,58).map((h,i) => <i key={i} className={recording ? 'live' : ''} style={{height: `${h * (recording ? (0.4 + ((i%5)/7)) : 0.4)}%`}}/> )}</div><div className="record-actions"><button className={recording ? 'record-button recording' : 'record-button'} onClick={startRecord}><span>{recording ? <Pause size={16}/> : <Mic size={16}/>}</span>{recording ? '结束录音' : recorded ? '重新录音' : '开始录音'}</button>{recorded && <button className="secondary" onClick={() => setPlaying(!playing)}>{playing ? <Pause size={15}/> : <Play size={15}/>} 回放</button>}</div></div><div className="tip"><span>练习小贴士</span><p>放慢速度，先把每个音节读清楚，再自然地连起来。</p><RotateCcw size={15}/></div></section>}
-      </div>
-    </main>{showAdd && <div className="modal-backdrop" onClick={() => setShowAdd(false)}><div className="modal" onClick={e => e.stopPropagation()}><div className="modal-head"><h2>添加练习句子</h2><button className="icon-btn" onClick={() => setShowAdd(false)}>×</button></div><label>英文句子<textarea autoFocus value={newText} onChange={e => setNewText(e.target.value)} placeholder="例如：I can make this happen."/></label><div className="modal-actions"><button className="secondary" onClick={() => setShowAdd(false)}>取消</button><button className="primary" onClick={addPhrase}>加入句子库</button></div></div></div>}
-  </div>;
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [status, setStatus] = useState('');
+  const [dragging, setDragging] = useState(false);
+  const [manualName, setManualName] = useState('');
+  const [manualVersion, setManualVersion] = useState('');
+  const [manualLicense, setManualLicense] = useState('MIT');
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
+  }, [entries]);
+
+  const stats = useMemo(
+    () => ({
+      total: entries.length,
+      ok: entries.filter(e => e.verdict === 'ok').length,
+      review: entries.filter(e => e.verdict === 'review').length,
+      risk: entries.filter(e => e.verdict === 'risk').length,
+    }),
+    [entries],
+  );
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return entries.filter(
+      e =>
+        (filter === 'all' || e.verdict === filter) &&
+        (!q || e.name.toLowerCase().includes(q) || e.license.toLowerCase().includes(q)),
+    );
+  }, [entries, filter, query]);
+
+  const selected = entries.find(e => e.id === selectedId) ?? null;
+
+  const analyze = (text: string) => {
+    const { entries: parsed, note } = parseManifest(text);
+    if (parsed.length > 0) {
+      setEntries(parsed);
+      setSelectedId(null);
+      setFilter('all');
+    }
+    setStatus(note);
+  };
+
+  const readFile = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result ?? '');
+      setInput(text);
+      analyze(text);
+    };
+    reader.readAsText(file);
+  };
+
+  const addManual = () => {
+    const name = manualName.trim();
+    if (!name) return;
+    const entry = makeEntry(name, manualVersion.trim() || '1.0.0', manualLicense);
+    setEntries(prev => [...prev, entry]);
+    setSelectedId(entry.id);
+    setManualName('');
+    setManualVersion('');
+    setStatus(`已添加 ${entry.name} · 结论：${VERDICT_LABEL[entry.verdict]}`);
+  };
+
+  const reset = () => {
+    setEntries(seedEntries());
+    setInput(SEED_TEXT);
+    setSelectedId(null);
+    setFilter('all');
+    setQuery('');
+    setStatus('已恢复示例数据');
+  };
+
+  const exportMarkdown = () => {
+    const md = [
+      '# License Lens 分析报告',
+      '',
+      `- 生成时间：${new Date().toLocaleString('zh-CN')}`,
+      `- 已分析依赖：${stats.total} · 兼容通过：${stats.ok} · 需要复核：${stats.review} · 高风险冲突：${stats.risk}`,
+      '',
+      '| 依赖 | 版本 | 许可证 | 结论 | 依据 |',
+      '| --- | --- | --- | --- | --- |',
+      ...entries.map(e => `| ${e.name} | ${e.version} | ${e.license} | ${VERDICT_LABEL[e.verdict]} | ${e.reason} |`),
+      '',
+    ].join('\n');
+    const url = URL.createObjectURL(new Blob([md], { type: 'text/markdown' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'license-report.md';
+    a.click();
+    URL.revokeObjectURL(url);
+    setStatus(`Markdown 报告已导出 · 覆盖全部 ${entries.length} 条依赖`);
+  };
+
+  const FILTERS: { key: 'all' | Verdict; label: string; count: number }[] = [
+    { key: 'all', label: '全部', count: stats.total },
+    { key: 'ok', label: '兼容通过', count: stats.ok },
+    { key: 'review', label: '需复核', count: stats.review },
+    { key: 'risk', label: '高风险', count: stats.risk },
+  ];
+
+  return (
+    <main className="app">
+      <header className="top">
+        <div className="brand">
+          <div className="logo">
+            <Scale size={20} />
+          </div>
+          <div>
+            <h1>License Lens</h1>
+            <small>依赖许可证兼容性分析</small>
+          </div>
+        </div>
+        <div className="actions">
+          <button onClick={reset}>
+            <RotateCcw size={14} /> 重置示例
+          </button>
+          <button className="primary" onClick={exportMarkdown}>
+            <FileDown size={14} /> 导出 Markdown
+          </button>
+        </div>
+      </header>
+
+      <section className="summary">
+        <div className="metric">
+          <small>已分析依赖</small>
+          <b>{stats.total}</b>
+        </div>
+        <div className="metric">
+          <small>兼容通过</small>
+          <b className="good">{stats.ok}</b>
+        </div>
+        <div className="metric">
+          <small>需要复核</small>
+          <b className="warn">{stats.review}</b>
+        </div>
+        <div className="metric">
+          <small>高风险冲突</small>
+          <b className="bad">{stats.risk}</b>
+        </div>
+      </section>
+
+      <section className="grid">
+        <aside className="panel">
+          <h3>导入依赖清单</h3>
+          <textarea
+            className="textarea"
+            spellCheck={false}
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            placeholder={'每行一个依赖，例如：\nreact@18.3.1 MIT\nlodash@4.17.21 MIT'}
+          />
+          <button className="primary analyze-btn" onClick={() => analyze(input)}>
+            开始分析
+          </button>
+          <div
+            className={dragging ? 'drop dragging' : 'drop'}
+            onDragOver={e => {
+              e.preventDefault();
+              setDragging(true);
+            }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={e => {
+              e.preventDefault();
+              setDragging(false);
+              const file = e.dataTransfer.files?.[0];
+              if (file) readFile(file);
+            }}
+          >
+            <FileUp size={16} />
+            <span>
+              拖放 package.json 或许可证清单，或
+              <label htmlFor="file">选择文件</label>
+            </span>
+            <input
+              id="file"
+              ref={fileInput}
+              type="file"
+              accept=".txt,.json,.csv,.lock,.md"
+              onChange={e => {
+                const file = e.target.files?.[0];
+                if (file) readFile(file);
+                e.target.value = '';
+              }}
+            />
+          </div>
+          <p className="hint">
+            支持每行一个依赖，格式：<code>名称@版本 许可证</code>。MIT、Apache-2.0、BSD-3-Clause
+            判定为兼容；GPL-3.0 判定为高风险；Proprietary 与未识别许可证需复核。
+          </p>
+          <div className="manual">
+            <input
+              placeholder="依赖名"
+              value={manualName}
+              onChange={e => setManualName(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && addManual()}
+            />
+            <input
+              className="version-input"
+              placeholder="版本"
+              value={manualVersion}
+              onChange={e => setManualVersion(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && addManual()}
+            />
+            <select value={manualLicense} onChange={e => setManualLicense(e.target.value)}>
+              <option>MIT</option>
+              <option>Apache-2.0</option>
+              <option>BSD-3-Clause</option>
+              <option>GPL-3.0</option>
+              <option>Proprietary</option>
+              <option>Unknown</option>
+            </select>
+            <button onClick={addManual}>
+              <Plus size={14} /> 添加
+            </button>
+          </div>
+          <div className="status">{status}</div>
+        </aside>
+
+        <section className="panel">
+          <h3>分析结果</h3>
+          <div className="filters">
+            {FILTERS.map(f => (
+              <button
+                key={f.key}
+                className={filter === f.key ? 'active' : ''}
+                onClick={() => setFilter(f.key)}
+              >
+                {f.label} <span>{f.count}</span>
+              </button>
+            ))}
+            <div className="search">
+              <Search size={14} />
+              <input
+                placeholder="搜索依赖…"
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="row head">
+            <div>依赖</div>
+            <div>版本</div>
+            <div>许可证</div>
+            <div>结论</div>
+            <div></div>
+          </div>
+          <div>
+            {filtered.map(e => (
+              <div
+                key={e.id}
+                className={e.id === selectedId ? 'row selected' : 'row'}
+                onClick={() => setSelectedId(e.id)}
+              >
+                <div className="pkg">
+                  <div className={`pkgicon ${e.verdict}`}>
+                    {e.verdict === 'ok' ? (
+                      <ShieldCheck size={15} />
+                    ) : e.verdict === 'risk' ? (
+                      <AlertOctagon size={15} />
+                    ) : (
+                      <AlertTriangle size={15} />
+                    )}
+                  </div>
+                  <b>{e.name}</b>
+                </div>
+                <div className="version">{e.version}</div>
+                <div className="license">{e.license}</div>
+                <div>
+                  <span className={`badge ${e.verdict}`}>{VERDICT_LABEL[e.verdict]}</span>
+                </div>
+                <div
+                  className="inspect"
+                  onClick={ev => {
+                    ev.stopPropagation();
+                    setSelectedId(e.id);
+                  }}
+                >
+                  查看依据
+                </div>
+              </div>
+            ))}
+            {filtered.length === 0 && (
+              <div className="empty">没有匹配当前搜索与筛选条件的依赖</div>
+            )}
+          </div>
+          {selected && (
+            <div className="details">
+              <h4>
+                {selected.name}@{selected.version} · {selected.license}
+                <span className={`badge ${selected.verdict}`}>{VERDICT_LABEL[selected.verdict]}</span>
+              </h4>
+              <p>{selected.reason}</p>
+              <p>
+                分析依据：识别到许可证标识 <code>{selected.license}</code>
+                ，对照内置规则（MIT / Apache-2.0 / BSD-3-Clause 兼容，GPL-3.0 高风险，Proprietary
+                与未知许可证需复核）给出初步结论。
+              </p>
+            </div>
+          )}
+          <div className="notice">
+            <b>兼容性提示</b>
+            <br />
+            GPL-3.0 组件要求衍生作品以 GPL 方式发布；专有许可证通常不能与开源分发直接兼容。请在发布前让法务复核结论。
+          </div>
+        </section>
+      </section>
+    </main>
+  );
 }
